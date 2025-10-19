@@ -343,41 +343,97 @@ func archiveCmd() {
 		log.Println(err)
 		return
 	}
-	resp, err := http.Get(ATCODER_API_SUBMISSION_URL + config.Atcoder.UserID)
-	if err != nil {
-		log.Println(err)
-		return
-	}
-	defer resp.Body.Close()
-	bytes, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		log.Println(err)
-		return
-	}
-	var ss []AtCoderSubmission
-	err = json.Unmarshal(bytes, &ss)
-	if err != nil {
-		log.Println(err)
-		return
+
+	// 対象コンテストをリストに追加
+	contests := []string{"abc040"} // 必要に応じて追加
+
+	ss := []AtCoderSubmission{}
+
+	for _, contestID := range contests {
+		page := 1
+		for {
+			submissionPage := fmt.Sprintf(
+				"https://atcoder.jp/contests/%s/submissions?f.User=%s&page=%d",
+				contestID,
+				config.Atcoder.UserID,
+				page,
+			)
+
+			doc, err := goquery.NewDocument(submissionPage)
+			if err != nil {
+				log.Println(err)
+				break
+			}
+
+			rows := doc.Find("table tbody tr")
+			if rows.Length() == 0 {
+				break
+			}
+
+			rows.Each(func(i int, tr *goquery.Selection) {
+				tds := tr.Find("td")
+				if tds.Length() < 10 {
+					return
+				}
+
+				// AC判定
+				result := tds.Eq(6).Find("span").Text()
+				if result != "AC" {
+					return
+				}
+
+				// 提出ID
+				submissionLink, exists := tds.Eq(9).Find("a.submission-details-link").Attr("href")
+				if !exists {
+					return
+				}
+				idStr := strings.Split(submissionLink, "/")[4]
+				id, _ := strconv.Atoi(idStr)
+
+				// 問題ID
+				problemLink, exists := tds.Eq(1).Find("a").Attr("href")
+				if !exists {
+					return
+				}
+				problemID := strings.Split(problemLink, "/")[4]
+
+				// 言語
+				language := tds.Eq(3).Find("a").Text()
+
+				// 提出時刻
+				timeStr := tds.Eq(0).Find("time").Text()
+				epoch := time.Now().Unix()
+				if t, err := time.Parse("2006-01-02 15:04:05", timeStr); err == nil {
+					epoch = t.Unix()
+				}
+
+				s := AtCoderSubmission{
+					ID:          id,
+					ProblemID:   problemID,
+					ContestID:   contestID,
+					UserID:      config.Atcoder.UserID,
+					Language:    language,
+					Result:      result,
+					EpochSecond: epoch,
+				}
+				ss = append(ss, s)
+			})
+
+			page++
+			time.Sleep(500 * time.Millisecond) // サーバ負荷軽減
+		}
 	}
 
-	//only ac
-	ss = funk.Filter(ss, func(s AtCoderSubmission) bool {
-		return s.Result == "AC"
-	}).([]AtCoderSubmission)
-
-	//skip the already archived code
+	// 既にアーカイブ済みを除外
 	archivedKeys := map[string]struct{}{}
 	filepath.Walk(config.Atcoder.RepositoryPath, func(path string, info os.FileInfo, err error) error {
 		if !info.IsDir() && strings.HasSuffix(path, "submission.json") {
 			bytes, err := ioutil.ReadFile(path)
 			if err != nil {
-				log.Println(err)
 				return err
 			}
 			var submission AtCoderSubmission
 			if err = json.Unmarshal(bytes, &submission); err != nil {
-				log.Println(err)
 				return err
 			}
 			key := submission.ContestID + "_" + submission.ProblemID
@@ -385,124 +441,89 @@ func archiveCmd() {
 		}
 		return nil
 	})
-	ss = funk.Filter(ss, func(s AtCoderSubmission) bool {
+
+	ssFiltered := []AtCoderSubmission{}
+	for _, s := range ss {
 		key := s.ContestID + "_" + s.ProblemID
-		_, ok := archivedKeys[key]
-		if ok {
-			return false
+		if _, ok := archivedKeys[key]; !ok {
+			ssFiltered = append(ssFiltered, s)
 		}
-		return true
-	}).([]AtCoderSubmission)
+	}
 
-	//rev sort by EpochSecond
-	sort.Slice(ss, func(i, j int) bool {
-		return ss[i].EpochSecond > ss[j].EpochSecond
-	})
-
-	//filter latest submission for each problem
-	v := map[string]struct{}{}
-	ss = funk.Filter(ss, func(s AtCoderSubmission) bool {
-		_, ok := v[s.ContestID+"_"+s.ProblemID]
-		if ok {
-			return false
-		}
-		v[s.ContestID+"_"+s.ProblemID] = struct{}{}
-		return true
-	}).([]AtCoderSubmission)
-
+	// アーカイブ処理
 	startTime := time.Now()
-	log.Printf("Archiving %d code...", len(ss))
-	funk.ForEach(ss, func(s AtCoderSubmission) {
-		url := fmt.Sprintf("https://atcoder.jp/contests/%s/submissions/%s", s.ContestID, strconv.Itoa(s.ID))
-
-		//log.Printf("Requesting... %s", url)
-		elapsedTime := time.Now().Sub(startTime)
-		if elapsedTime.Milliseconds() < 1500 {
-			sleepTime := time.Duration(1500 - elapsedTime.Milliseconds())
-			time.Sleep(time.Millisecond * sleepTime)
-		}
+	log.Printf("Archiving %d code...", len(ssFiltered))
+	for _, s := range ssFiltered {
+		url := fmt.Sprintf("https://atcoder.jp/contests/%s/submissions/%d", s.ContestID, s.ID)
 		resp, err := http.Get(url)
-		defer resp.Body.Close()
-		startTime = time.Now()
 		if err != nil {
 			log.Println(err)
-			return
+			continue
 		}
-
+		defer resp.Body.Close()
 		doc, err := goquery.NewDocumentFromReader(resp.Body)
 		if err != nil {
 			log.Println(err)
-			return
+			continue
 		}
-		userID := s.UserID
-		userEmail := config.Atcoder.UserEmail
-		language := s.Language
-		contestID := s.ContestID
-		problemID := s.ProblemID
-		epochSecond := s.EpochSecond
-		doc.Find("#submission-code").Each(func(i int, gs *goquery.Selection) {
-			code := gs.Text()
-			if code == "" {
-				log.Print("Empty string...")
-				return
-			}
-			fileName := languageToFileName(language)
-			archiveDirPath := filepath.Join(config.Atcoder.RepositoryPath, "atcoder.jp", contestID, problemID)
 
-			if err = archiveFile(code, fileName, archiveDirPath, s); err != nil {
-				log.Println("Fail to archive the code at", filepath.Join(archiveDirPath, fileName))
-				return
-			}
-			log.Println("archived the code at ", filepath.Join(archiveDirPath, fileName))
-			//If the archive repo is the git repo
-			//git add and git commit
-			if !isDirExist(filepath.Join(config.Atcoder.RepositoryPath, ".git")) {
-				return
-			}
+		code := doc.Find("#submission-code").Text()
+		if code == "" {
+			log.Println("Empty code:", url)
+			continue
+		}
 
-			r, err := git.PlainOpen(config.Atcoder.RepositoryPath)
-			if err != nil {
-				log.Println(err)
-				return
-			}
+		fileName := languageToFileName(s.Language)
+		archiveDirPath := filepath.Join(config.Atcoder.RepositoryPath, "atcoder.jp", s.ContestID, s.ProblemID)
+		if err = archiveFile(code, fileName, archiveDirPath, s); err != nil {
+			log.Println("Fail to archive code at", filepath.Join(archiveDirPath, fileName))
+			continue
+		}
+		log.Println("Archived:", filepath.Join(archiveDirPath, fileName))
 
-			w, err := r.Worktree()
-			if err != nil {
-				log.Println(err)
-				return
-			}
-			//add source code
-			fmt.Println(fileName)
-			dirPath := filepath.Join("atcoder.jp", contestID, problemID)
-			_, err = w.Add(filepath.Join(dirPath, fileName))
-			if err != nil {
-				log.Println(err)
+		// Git追加・コミット
+		if !isDirExist(filepath.Join(config.Atcoder.RepositoryPath, ".git")) {
+			continue
+		}
+		r, err := git.PlainOpen(config.Atcoder.RepositoryPath)
+		if err != nil {
+			log.Println(err)
+			continue
+		}
+		w, err := r.Worktree()
+		if err != nil {
+			log.Println(err)
+			continue
+		}
 
-				return
-			}
+		_, err = w.Add(filepath.Join("atcoder.jp", s.ContestID, s.ProblemID, fileName))
+		if err != nil {
+			log.Println(err)
+			continue
+		}
+		_, err = w.Add(filepath.Join("atcoder.jp", s.ContestID, s.ProblemID, "submission.json"))
+		if err != nil {
+			log.Println(err)
+			continue
+		}
 
-			//add submission json
-			_, err = w.Add(filepath.Join(dirPath, "submission.json"))
-			if err != nil {
-				log.Println(err)
-				return
-			}
-
-			message := fmt.Sprintf("[AC] %s %s", contestID, problemID)
-			_, err = w.Commit(message, &git.CommitOptions{
-				Author: &object.Signature{
-					Name:  userID,
-					Email: userEmail,
-					When:  time.Unix(epochSecond, 0),
-				},
-			})
-			if err != nil {
-				log.Println(err)
-				return
-			}
-			return
+		message := fmt.Sprintf("[AC] %s %s", s.ContestID, s.ProblemID)
+		_, err = w.Commit(message, &git.CommitOptions{
+			Author: &object.Signature{
+				Name:  s.UserID,
+				Email: config.Atcoder.UserEmail,
+				When:  time.Unix(s.EpochSecond, 0),
+			},
 		})
-	})
+		if err != nil {
+			log.Println(err)
+			continue
+		}
+
+		time.Sleep(1500 * time.Millisecond) // サーバ負荷軽減
+	}
+
+	log.Println("Archive completed.")
 }
 func validateConfig(config Config) bool {
 	//TODO check path
