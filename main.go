@@ -26,7 +26,7 @@ import (
 )
 
 const APP_NAME = "procon-gardener"
-const ATCODER_API_SUBMISSION_URL = "https://kenkoooo.com/atcoder/atcoder-api/v3/user/submissions?user="
+const ATCODER_API_SUBMISSION_URL = "https://kenkoooo.com/atcoder/atcoder-api/v3/user/submissions?user=%s&from_second="
 
 type AtCoderSubmission struct {
 	ID            int     `json:"id"`
